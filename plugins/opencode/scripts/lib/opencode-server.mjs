@@ -8,7 +8,7 @@ import { spawn, spawnSync } from "node:child_process";
 // in auto-heal.mjs because it is tightly coupled to heal-decision logic, but
 // conceptually it is a server probe.
 export { probeSessionTerminal } from "./auto-heal.mjs";
-import { ensureOpencodeConfig } from "./opencode-config.mjs";
+import { assertOpencodeConfig } from "./opencode-config.mjs";
 import { classifyError } from "./errors.mjs";
 
 const IS_WINDOWS = process.platform === "win32";
@@ -115,13 +115,8 @@ export async function ensureServer(opts = {}) {
     return { url, alreadyRunning: true };
   }
 
-  // Self-heal permissions BEFORE spawning the server. The running daemon reads
-  // opencode.json at startup; fixing it after the spawn would require a restart.
-  try {
-    ensureOpencodeConfig();
-  } catch (err) {
-    process.stderr.write(`[opencode-companion] ensureOpencodeConfig failed: ${err.message}\n`);
-  }
+  // Throws on a missing or hang-prone worker config; the server reads it only at startup.
+  const configPath = assertOpencodeConfig();
 
   // Start the server
   // Windows npm shims are .cmd/.ps1; spawn() only resolves those via a shell.
@@ -129,6 +124,7 @@ export async function ensureServer(opts = {}) {
     stdio: ["ignore", "pipe", "pipe"],
     detached: true,
     cwd: opts.cwd,
+    env: { ...process.env, OPENCODE_CONFIG: configPath },
     shell: IS_WINDOWS,
   });
   proc.unref();

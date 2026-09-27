@@ -20,7 +20,7 @@ import { buildReviewPrompt, buildTaskPrompt } from "./lib/prompts.mjs";
 import { getDiff, getStatus as getGitStatus } from "./lib/git.mjs";
 import { readJson } from "./lib/fs.mjs";
 import { autoHealJob, autoHealJobs, getSessionLastActivity } from "./lib/auto-heal.mjs";
-import { ensureOpencodeConfig, readOpencodeConfig, missingPermissions, resolveConfigPath } from "./lib/opencode-config.mjs";
+import { checkOpencodeConfig } from "./lib/opencode-config.mjs";
 import { stateRoot } from "./lib/state.mjs";
 import { runCommand } from "./lib/process.mjs";
 
@@ -834,23 +834,16 @@ async function handleDoctor(argv) {
     push("opencode-version", "WARN", "could not resolve version", null);
   }
 
-  // 3. opencode.json permissions (HEADLESS-SAFE — biggest footgun)
-  const cfg = readOpencodeConfig();
-  const missing = missingPermissions(cfg.data);
-  if (cfg.exists && missing.length === 0) {
-    push("opencode-config", "PASS", `${cfg.path} (all permissions allow)`, null);
+  // 3. worker config permissions (headless-safe; never auto-written)
+  const cfg = checkOpencodeConfig();
+  if (!cfg.exists) {
+    push("opencode-config", "FAIL", `${cfg.path} — file missing`,
+      "Create it from worker-config.example.json (or set OPENCODE_COMPANION_CONFIG)");
+  } else if (cfg.missing.length === 0) {
+    push("opencode-config", "PASS", `${cfg.path} (no "ask" permissions)`, null);
   } else {
-    const detail = cfg.exists
-      ? `${cfg.path} — missing: ${missing.join(", ")}`
-      : `${cfg.path} — file missing`;
-    if (fix) {
-      const r = ensureOpencodeConfig({ silent: true });
-      push("opencode-config", r.changed ? "PASS" : "WARN",
-        r.changed ? `fixed: ${r.path}` : detail, null);
-    } else {
-      push("opencode-config", "FAIL", detail,
-        "Run with --fix (or set: permission.{bash,edit,webfetch,external_directory} = \"allow\")");
-    }
+    push("opencode-config", "FAIL", `${cfg.path} — would hang: ${cfg.missing.join(", ")}`,
+      'Set each to "allow" or "deny" in the worker config');
   }
 
   // 4. server reachable
@@ -963,6 +956,7 @@ async function handleConfig(argv) {
     ["OPENCODE_COMPLETION_POLL_MS", "5000", "Watcher poll interval during sendPrompt"],
     ["OPENCODE_MONITOR_RESULT_CHARS","(hook)", "Monitor hook: max chars per tool-result snippet"],
     ["OPENCODE_MONITOR_HEARTBEAT_POLLS","(hook)", "Monitor hook: polls between heartbeat pings"],
+    ["OPENCODE_COMPANION_CONFIG",   "~/.config/opencode/worker.json", "Worker config passed to opencode serve as OPENCODE_CONFIG"],
     ["OPENCODE_COMPANION_DATA",     "(self-derived)", "Override for plugin data dir"],
     ["OPENCODE_SERVER_PASSWORD",    "(unset)", "HTTP Basic auth password"],
     ["OPENCODE_SERVER_USERNAME",    "opencode", "HTTP Basic auth username"],
@@ -979,8 +973,8 @@ async function handleConfig(argv) {
 
   const workspace = await resolveWorkspace();
   const sRoot = stateRoot(workspace);
-  const cfg = readOpencodeConfig();
-  const missing = missingPermissions(cfg.data);
+  const cfg = checkOpencodeConfig();
+  const missing = cfg.missing;
   const serverUrl = "http://127.0.0.1:4096";
   let serverReachable = false;
   try {

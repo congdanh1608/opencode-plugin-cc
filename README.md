@@ -19,8 +19,11 @@ npm i -g opencode-ai   # or: brew install opencode
 
 # 2. Install the plugin (see Install section below)
 
-# 3. Run the self-test — fixes common footguns for you
-node ~/.claude/plugins/cache/tasict-opencode-plugin-cc/opencode/1.1.0/scripts/opencode-companion.mjs doctor --fix
+# 3. Create the worker config (never auto-written)
+cp plugins/opencode/worker-config.example.json ~/.config/opencode/worker.json
+
+# 4. Run the self-test
+node ~/.claude/plugins/cache/tasict-opencode-plugin-cc/opencode/1.1.0/scripts/opencode-companion.mjs doctor
 ```
 
 Then delegate a task from Claude Code:
@@ -29,9 +32,11 @@ Then delegate a task from Claude Code:
 /opencode:rescue grep for XXX in src/ and summarize
 ```
 
-`doctor --fix` writes the correct `~/.config/opencode/opencode.json` permissions so the
-bash tool does not hang in headless mode (sst/opencode#14473). This is the single biggest
-footgun for newcomers — `ensureServer` will also run this fix automatically on first use.
+The companion starts `opencode serve` with `OPENCODE_CONFIG` set to the worker config
+(`~/.config/opencode/worker.json`, or `$OPENCODE_COMPANION_CONFIG`). It never edits your
+`opencode.json`. It refuses to start while any permission in the worker config is `"ask"`,
+or while `external_directory` / `doom_loop` are unset (both default to `"ask"`), because
+`"ask"` hangs headless tools (sst/opencode#14473). Use `"allow"` or `"deny"`.
 
 ## What You Get
 
@@ -170,7 +175,8 @@ Run `companion.mjs config` to see resolved values with source (env vs default).
 ## Pitfalls
 
 - **`companion status` stuck on `investigating`** — run `companion heal` (or wait; `status`/`result` auto-heal on every call).
-- **Bash tool hangs for minutes** — run `companion doctor --fix` to merge the required `permission.*=allow` keys into `~/.config/opencode/opencode.json`. This is sst/opencode#14473 in headless mode.
+- **Bash tool hangs for minutes** — a permission resolved to `"ask"` (sst/opencode#14473). `companion doctor` lists the offending keys in the worker config. A project `opencode.json` can also set `"ask"`; the server has to be restarted after a config change.
+- **Do not run your own `opencode serve --port 4096`** — the companion reuses any healthy server on that port, with whatever config it was started with.
 - **`CLAUDE_PLUGIN_DATA` points at another plugin** — harmless: the companion self-derives its own data dir from `import.meta.url`. `doctor` will print a WARN so you know.
 
 ## Troubleshooting
