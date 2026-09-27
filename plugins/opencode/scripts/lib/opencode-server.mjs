@@ -120,8 +120,9 @@ export async function ensureServer(opts = {}) {
 
   // Start the server
   // Windows npm shims are .cmd/.ps1; spawn() only resolves those via a shell.
+  // stdio must not be piped: open pipes to the detached server keep this process alive.
   const proc = spawn("opencode", ["serve", "--port", String(port)], {
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: "ignore",
     detached: true,
     cwd: opts.cwd,
     env: { ...process.env, OPENCODE_CONFIG: configPath },
