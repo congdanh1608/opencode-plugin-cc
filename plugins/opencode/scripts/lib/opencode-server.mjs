@@ -9,6 +9,7 @@ import net from "node:net";
 // in auto-heal.mjs because it is tightly coupled to heal-decision logic, but
 // conceptually it is a server probe.
 export { probeSessionTerminal } from "./auto-heal.mjs";
+import { evaluateRun } from "./auto-heal.mjs";
 import { assertOpencodeConfig } from "./opencode-config.mjs";
 import { classifyError } from "./errors.mjs";
 import { authHeaders, newServerPassword, readServerState, writeServerState } from "./server-auth.mjs";
@@ -24,7 +25,6 @@ const SERVER_START_TIMEOUT = 30_000;
 // lives in the watcher via IDLE_TIMEOUT_MS + pgrep child-process check.
 const REQUEST_TIMEOUT_MS = Number(process.env.OPENCODE_REQUEST_TIMEOUT_MS) || 1_800_000;
 const PROMPT_TIMEOUT_MS = Number(process.env.OPENCODE_PROMPT_TIMEOUT_MS) || 14_400_000;
-const STRICT_TERMINAL = process.env.OPENCODE_STRICT_TERMINAL === "1";
 // How long a session may go without ANY activity signal before we assume it
 // is stuck. Activity = new message, new parts, tool output growth, status
 // change. Default 1h — long enough for silent-but-live tool subprocesses.
@@ -78,7 +78,7 @@ export async function isServerRunning(host = DEFAULT_HOST, port = DEFAULT_PORT, 
     });
     if (!res.ok) return false;
     const info = await res.json();
-    return typeof info?.pid === "number";
+    return typeof info?.version === "string" || typeof info?.pid === "number" || Array.isArray(info?.urls);
   } catch {
     return false;
   }
@@ -230,7 +230,7 @@ export function createClient(baseUrl, opts = {}) {
       return request("GET", `/api/session/${sessionId}/message${qs ? "?" + qs : ""}`).then((r) => r.data);
     },
 
-    /** Queue a V2 prompt and wait for its assistant message. */
+    /** Queue a V2 prompt, wait for the session to go idle, return the final assistant step. */
     sendPrompt: async (sessionId, promptText, opts = {}) => {
       const startedAt = Date.now();
       if (opts.agent) await request("POST", `/api/session/${sessionId}/agent`, { agent: opts.agent });
@@ -240,12 +240,16 @@ export function createClient(baseUrl, opts = {}) {
       let lastActivity = Date.now();
       let signature = "";
       while (Date.now() - startedAt < PROMPT_TIMEOUT_MS) {
-        const page = await request("GET", `/api/session/${sessionId}/message?limit=1&order=desc&type=assistant`);
-        const message = page.data?.[0];
-        const next = JSON.stringify(message ?? null);
+        const session = (await request("GET", `/api/session/${sessionId}`)).data;
+        const messages = (await request("GET", `/api/session/${sessionId}/message?limit=50&order=desc`)).data;
+        const run = evaluateRun(session, messages, startedAt);
+        const next = JSON.stringify([session?.time?.updated, session?.time?.idle, messages?.[0]]);
         if (next !== signature) { signature = next; lastActivity = Date.now(); }
-        if (message?.time?.completed >= startedAt &&
-            (STRICT_TERMINAL ? typeof message.finish === "string" : true)) return message;
+        if (run.done) {
+          if (run.outcome && run.outcome !== "succeeded") throw new Error(`OpenCode session ${run.outcome}`);
+          if (!run.final) throw new Error("session finished without an assistant message");
+          return run.final;
+        }
         if (Date.now() - lastActivity > IDLE_TIMEOUT_MS) throw new Error("session idle timeout");
         await new Promise((resolve) => setTimeout(resolve, Number(process.env.OPENCODE_COMPLETION_POLL_MS) || 5000));
       }

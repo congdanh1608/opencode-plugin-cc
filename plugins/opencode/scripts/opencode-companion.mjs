@@ -777,23 +777,12 @@ async function handleHeal(argv) {
 function extractResponseText(response) {
   if (typeof response === "string") return response;
 
-  // Response shape: { info: { ... }, parts: [ { type: "text", text: "..." }, ... ] }
-  if (response?.content) {
+  // V2 assistant message: { content: [{ type: "text", text }, ...] }
+  if (Array.isArray(response?.content)) {
     return response.content
       .filter((p) => p.type === "text")
       .map((p) => p.text)
       .join("\n");
-  }
-
-  // Fallback: try info.content or just stringify
-  if (response?.info?.content) {
-    if (typeof response.info.content === "string") return response.info.content;
-    if (Array.isArray(response.info.content)) {
-      return response.info.content
-        .filter((p) => p.type === "text")
-        .map((p) => p.text)
-        .join("\n");
-    }
   }
 
   return JSON.stringify(response, null, 2);

@@ -25,7 +25,6 @@ import { ensureDir } from "./fs.mjs";
 import { upsertJob, jobDataPath } from "./state.mjs";
 import { authHeaders, serverUrl } from "./server-auth.mjs";
 
-const STRICT_TERMINAL = process.env.OPENCODE_STRICT_TERMINAL === "1";
 // A worker/session can be legitimately silent for a while (big model thinking,
 // slow tool) — only declare it dead after >60s of no session activity AND no
 // live task-worker process. 60s matches the spec.
@@ -66,58 +65,75 @@ function extractPartsText(parts) {
     .join("\n");
 }
 
+/** Joined text parts of a V2 assistant message. */
+export function messageText(message) {
+  if (typeof message?.content === "string") return message.content;
+  return extractPartsText(message?.content);
+}
+
+/**
+ * V2 run state: finished only once the session is idle after startedAt.
+ * Result = last "stop" assistant message of the run, else the last assistant message.
+ */
+export function evaluateRun(session, messages, startedAt) {
+  const list = Array.isArray(messages) ? messages : [];
+  const created = (m) => (typeof m?.time?.created === "number" ? m.time.created : 0);
+  const idleMsg = list.find((m) => m?.type === "idle" && created(m) >= startedAt);
+  const idleAt = session?.time?.idle;
+  const done = (typeof idleAt === "number" && idleAt >= startedAt) || !!idleMsg;
+  const outcome = session?.outcome ?? idleMsg?.outcome;
+  const steps = list
+    .filter((m) => m?.type === "assistant" && created(m) >= startedAt)
+    .sort((a, b) => created(a) - created(b));
+  const final = [...steps].reverse().find((m) => m.finish === "stop") ?? steps[steps.length - 1] ?? null;
+  return { done, outcome, final };
+}
+
 /**
  * Query the opencode server for the terminal state of a session.
  *
  * Returns:
- *   { terminal: true,  finish, completed, text, info } when the last assistant
- *     message has info.time.completed >= startedAt AND typeof info.finish === 'string'.
- *   { terminal: false, reachable: true, lastUpdatedAt, lastInfo }           when session exists but no terminal marker.
- *   { terminal: false, reachable: false, error }                             when server unreachable / errored.
+ *   { terminal: true, outcome, finish, completed, text, info } when the session is idle after startedAt.
+ *   { terminal: false, reachable: true, lastUpdatedAt, lastInfo } while the session is still running.
+ *   { terminal: false, reachable: false, error }                  when server unreachable / errored.
  *
  * @param {string} baseUrl
  * @param {string} sessionId
- * @param {number} startedAtMs - epoch ms; only treat completions >= this as ours
+ * @param {number} startedAtMs - epoch ms; only treat idle at/after this as ours
  * @param {object} [headers]
  */
 export async function probeSessionTerminal(baseUrl, sessionId, startedAtMs, headers) {
   const h = headers ?? buildHeaders();
   try {
-    // V2 returns newest assistant messages first with order=desc.
-    const res = await fetch(`${baseUrl}/api/session/${sessionId}/message?limit=1&order=desc&type=assistant`, {
+    const get = (p) => fetch(`${baseUrl}/api/session/${sessionId}${p}`, {
       method: "GET",
       headers: h,
       signal: AbortSignal.timeout(10_000),
     });
-    if (!res.ok) {
-      return { terminal: false, reachable: true, error: `HTTP ${res.status}` };
+    const [sres, mres] = await Promise.all([get(""), get("/message?limit=50&order=desc")]);
+    if (!sres.ok || !mres.ok) {
+      return { terminal: false, reachable: true, error: `HTTP ${sres.ok ? mres.status : sres.status}` };
     }
-    const page = await res.json();
-    const info = page.data?.[0];
-    if (!info) {
-      return { terminal: false, reachable: true, lastUpdatedAt: 0, lastInfo: null };
-    }
+    const session = (await sres.json()).data;
+    const messages = (await mres.json()).data;
+    const run = evaluateRun(session, messages, startedAtMs || 0);
+    const info = run.final;
 
-    const completed = typeof info.time?.completed === "number" ? info.time.completed : 0;
-    const created = typeof info.time?.created === "number" ? info.time.created : 0;
-    const lastUpdatedAt = Math.max(completed, created);
-
-    const looksTerminal =
-      info.type === "assistant" &&
-      completed >= (startedAtMs || 0) &&
-      (STRICT_TERMINAL
-        ? typeof info.finish === "string"
-        : typeof info.finish === "string" || completed > 0);
-
-    if (looksTerminal) {
+    if (run.done) {
+      const completed = info?.time?.completed ?? session?.time?.idle ?? Date.now();
       return {
         terminal: true,
-        finish: info.finish,
+        outcome: run.outcome,
+        finish: info?.finish,
         completed,
-        text: extractPartsText(info.content),
+        text: messageText(info),
         info,
       };
     }
+    const lastUpdatedAt = Math.max(
+      session?.time?.updated ?? 0,
+      ...(messages ?? []).map((m) => Math.max(m?.time?.created ?? 0, m?.time?.completed ?? 0)),
+    );
     return { terminal: false, reachable: true, lastUpdatedAt, lastInfo: info };
   } catch (err) {
     return { terminal: false, reachable: false, error: err.message };
@@ -142,7 +158,7 @@ export async function getSessionLastActivity(baseUrl, sessionId) {
   if (!sessionId) return null;
   const h = buildHeaders();
   try {
-    const res = await fetch(`${baseUrl}/api/session/${sessionId}/message?limit=1&order=desc`, {
+    const res = await fetch(`${baseUrl}/api/session/${sessionId}/message?limit=1&order=desc&type=assistant`, {
       method: "GET",
       headers: h,
       signal: AbortSignal.timeout(5_000),
@@ -223,6 +239,23 @@ export async function autoHealJob(workspace, job, opts = {}) {
     0;
 
   const probe = await probeSessionTerminal(baseUrl, job.opencodeSessionId, startedAtMs);
+
+  if (probe.terminal && probe.outcome && probe.outcome !== "succeeded") {
+    const errMsg = `session ${probe.outcome}`;
+    if (dryRun) return { job, action: "would-fail", details: { errorMessage: errMsg } };
+    upsertJob(workspace, {
+      id: job.id,
+      status: "failed",
+      completedAt: new Date().toISOString(),
+      errorMessage: errMsg,
+      healed: true,
+    });
+    return {
+      job: { ...job, status: "failed", errorMessage: errMsg, healed: true },
+      action: "healed-failed",
+      details: { errorMessage: errMsg },
+    };
+  }
 
   if (probe.terminal) {
     const completedIso = new Date(probe.completed).toISOString();

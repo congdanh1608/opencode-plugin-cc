@@ -71,8 +71,8 @@ export function renderResult(job, resultData) {
     if (resultData.rendered) {
       lines.push(`### Output\n\n${resultData.rendered}`);
     } else if (resultData.messages) {
-      // Extract the last assistant message
-      const assistantMsgs = resultData.messages.filter((m) => m.role === "assistant");
+      const msgs = Array.isArray(resultData.messages) ? resultData.messages : [resultData.messages];
+      const assistantMsgs = msgs.filter((m) => m.type === "assistant");
       const last = assistantMsgs[assistantMsgs.length - 1];
       if (last) {
         const text = extractMessageText(last);
@@ -138,12 +138,6 @@ export function renderReview(review) {
  */
 function extractMessageText(msg) {
   if (typeof msg.content === "string") return msg.content;
-  if (Array.isArray(msg.parts)) {
-    return msg.parts
-      .filter((p) => p.type === "text")
-      .map((p) => p.text)
-      .join("\n");
-  }
   if (Array.isArray(msg.content)) {
     return msg.content
       .filter((p) => p.type === "text")
