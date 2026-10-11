@@ -7,6 +7,7 @@ import process from "node:process";
 import { isServerRunning } from "./lib/opencode-server.mjs";
 import { resolveWorkspace } from "./lib/workspace.mjs";
 import { loadState } from "./lib/state.mjs";
+import { serverUrl } from "./lib/server-auth.mjs";
 
 const event = process.argv[2]; // "SessionStart" or "SessionEnd"
 
@@ -15,7 +16,8 @@ async function main() {
 
   if (event === "SessionStart") {
     // Check if OpenCode server is available (but don't auto-start it)
-    const running = await isServerRunning();
+    const active = new URL(serverUrl());
+    const running = await isServerRunning(active.hostname, Number(active.port));
     if (running) {
       process.stderr.write("[opencode-companion] OpenCode server detected.\n");
     }

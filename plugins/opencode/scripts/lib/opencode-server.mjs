@@ -3,6 +3,7 @@
 // OpenCode exposes a REST API + SSE. This module wraps that API.
 
 import { spawn, spawnSync } from "node:child_process";
+import net from "node:net";
 
 // Re-export for spec-compliance / discoverability: probeSessionTerminal lives
 // in auto-heal.mjs because it is tightly coupled to heal-decision logic, but
@@ -10,6 +11,7 @@ import { spawn, spawnSync } from "node:child_process";
 export { probeSessionTerminal } from "./auto-heal.mjs";
 import { assertOpencodeConfig } from "./opencode-config.mjs";
 import { classifyError } from "./errors.mjs";
+import { authHeaders, newServerPassword, readServerState, writeServerState } from "./server-auth.mjs";
 
 const IS_WINDOWS = process.platform === "win32";
 const DEFAULT_PORT = 4096;
@@ -27,10 +29,14 @@ const STRICT_TERMINAL = process.env.OPENCODE_STRICT_TERMINAL === "1";
 // is stuck. Activity = new message, new parts, tool output growth, status
 // change. Default 1h — long enough for silent-but-live tool subprocesses.
 const IDLE_TIMEOUT_MS = Number(process.env.OPENCODE_IDLE_TIMEOUT_MS) || 3_600_000;
-// Bash-tool "no child process" consecutive-miss threshold. If the latest
-// tool is a bash in status=running but opencode serve has zero child
-// processes for N polls in a row, declare stuck. 3 × 5s = 15s grace.
-const PGREP_MISS_THRESHOLD = Number(process.env.OPENCODE_PGREP_MISS_THRESHOLD) || 3;
+
+function modelRef(model) {
+  if (typeof model === "object") return model;
+  const slash = model.indexOf("/");
+  if (slash < 1) throw new Error("Model must be provider/model for OpenCode V2");
+  const [id, variant] = model.slice(slash + 1).split("#", 2);
+  return { providerID: model.slice(0, slash), id, ...(variant ? { variant } : {}) };
+}
 
 /**
  * Find the PID of `opencode serve` listening on `port`, if we can.
@@ -59,40 +65,20 @@ function resolveServePid(port) {
 }
 
 /**
- * Count direct child processes of `pid`. Returns:
- *   -1 — feature unavailable (Windows, pgrep missing, etc.) — caller should skip check
- *    0 — no children
- *   >0 — that many children
- */
-function countChildren(pid) {
-  if (!pid || IS_WINDOWS) return -1;
-  try {
-    const r = spawnSync("pgrep", ["-P", String(pid)], {
-      encoding: "utf8",
-      timeout: 2000,
-    });
-    if (r.error) return -1;
-    // pgrep exits 1 when no matches (empty stdout) — that's a real "zero", not a failure
-    const out = (r.stdout || "").trim();
-    if (!out) return 0;
-    return out.split("\n").filter(Boolean).length;
-  } catch {
-    return -1;
-  }
-}
-
-/**
  * Check if an OpenCode server is already running on the given port.
  * @param {string} host
  * @param {number} port
  * @returns {Promise<boolean>}
  */
-export async function isServerRunning(host = DEFAULT_HOST, port = DEFAULT_PORT) {
+export async function isServerRunning(host = DEFAULT_HOST, port = DEFAULT_PORT, password = readServerState()?.password) {
   try {
-    const res = await fetch(`http://${host}:${port}/global/health`, {
+    const res = await fetch(`http://${host}:${port}/api/info`, {
+      headers: authHeaders(password),
       signal: AbortSignal.timeout(3000),
     });
-    return res.ok;
+    if (!res.ok) return false;
+    const info = await res.json();
+    return typeof info?.pid === "number";
   } catch {
     return false;
   }
@@ -108,11 +94,42 @@ export async function isServerRunning(host = DEFAULT_HOST, port = DEFAULT_PORT) 
  */
 export async function ensureServer(opts = {}) {
   const host = opts.host ?? DEFAULT_HOST;
-  const port = opts.port ?? DEFAULT_PORT;
-  const url = `http://${host}:${port}`;
+  const saved = readServerState();
+  let port = opts.port ?? saved?.port ?? DEFAULT_PORT;
+  let url = `http://${host}:${port}`;
+  if (await isServerRunning(host, port, saved?.password)) return { url, alreadyRunning: true };
 
-  if (await isServerRunning(host, port)) {
-    return { url, alreadyRunning: true };
+  // A listener with different credentials is never adopted. Only stop a PID
+  // recorded by this plugin and still bound to the recorded port.
+  const occupied = async (p) => {
+    try { await fetch(`http://${host}:${p}/api/info`, { headers: authHeaders(saved?.password), signal: AbortSignal.timeout(1500) }); return true; }
+    catch {
+      return new Promise((resolve) => {
+        const socket = net.createServer();
+        socket.once("error", () => resolve(true));
+        socket.listen(p, host, () => socket.close(() => resolve(false)));
+      });
+    }
+  };
+  if (await occupied(port)) {
+    const listener = resolveServePid(port);
+    if (saved?.pid && saved.port === port && listener === saved.pid && ![66885, 85362].includes(listener)) {
+      try { process.kill(listener, "SIGTERM"); } catch { /* The port check below chooses another port. */ }
+      const until = Date.now() + 5000;
+      while (Date.now() < until && resolveServePid(port) === listener)
+        await new Promise((r) => setTimeout(r, 100));
+    }
+    if (await occupied(port)) {
+      port = await new Promise((resolve, reject) => {
+        const socket = net.createServer();
+        socket.once("error", reject);
+        socket.listen(0, host, () => {
+          const selected = socket.address().port;
+          socket.close(() => resolve(selected));
+        });
+      });
+      url = `http://${host}:${port}`;
+    }
   }
 
   // Throws on a missing or hang-prone worker config; the server reads it only at startup.
@@ -121,11 +138,12 @@ export async function ensureServer(opts = {}) {
   // Start the server
   // Windows npm shims are .cmd/.ps1; spawn() only resolves those via a shell.
   // stdio must not be piped: open pipes to the detached server keep this process alive.
-  const proc = spawn("opencode", ["serve", "--port", String(port)], {
+  const password = newServerPassword();
+  const proc = spawn("opencode", ["serve", "--port", String(port), "--hostname", host], {
     stdio: "ignore",
     detached: true,
     cwd: opts.cwd,
-    env: { ...process.env, OPENCODE_CONFIG: configPath },
+    env: { ...process.env, OPENCODE_CONFIG: configPath, OPENCODE_PASSWORD: password },
     shell: IS_WINDOWS,
   });
   proc.unref();
@@ -133,7 +151,8 @@ export async function ensureServer(opts = {}) {
   // Wait for the server to become ready
   const deadline = Date.now() + SERVER_START_TIMEOUT;
   while (Date.now() < deadline) {
-    if (await isServerRunning(host, port)) {
+    if (await isServerRunning(host, port, password)) {
+      writeServerState({ url, port, pid: proc.pid, password });
       return { url, pid: proc.pid, alreadyRunning: false };
     }
     await new Promise((r) => setTimeout(r, 500));
@@ -146,21 +165,16 @@ export async function ensureServer(opts = {}) {
  * Create an API client bound to a running OpenCode server.
  * @param {string} baseUrl
  * @param {object} [opts]
- * @param {string} [opts.directory] - workspace directory for x-opencode-directory header
+ * @param {string} [opts.directory] - workspace location for V2 requests
  * @returns {OpenCodeClient}
  */
 export function createClient(baseUrl, opts = {}) {
   const headers = {
     "Content-Type": "application/json",
   };
-  if (opts.directory) {
-    headers["x-opencode-directory"] = opts.directory;
-  }
-  if (process.env.OPENCODE_SERVER_PASSWORD) {
-    const user = process.env.OPENCODE_SERVER_USERNAME ?? "opencode";
-    const cred = Buffer.from(`${user}:${process.env.OPENCODE_SERVER_PASSWORD}`).toString("base64");
-    headers["Authorization"] = `Basic ${cred}`;
-  }
+  Object.assign(headers, authHeaders(opts.password));
+  const locationQuery = opts.directory
+    ? `?${new URLSearchParams({ "location[directory]": opts.directory })}` : "";
 
   async function request(method, path, body) {
     const startedAt = Date.now();
@@ -193,263 +207,73 @@ export function createClient(baseUrl, opts = {}) {
     baseUrl,
 
     // Health
-    health: () => request("GET", "/global/health"),
+    health: () => request("GET", "/api/info"),
 
     // Sessions
-    listSessions: () => request("GET", "/session"),
-    createSession: (opts = {}) => request("POST", "/session", opts),
-    getSession: (id) => request("GET", `/session/${id}`),
-    deleteSession: (id) => request("DELETE", `/session/${id}`),
-    abortSession: (id) => request("POST", `/session/${id}/abort`),
-    getSessionStatus: () => request("GET", "/session/status"),
-    getSessionDiff: (id) => request("GET", `/session/${id}/diff`),
+    listSessions: async () => (await request("GET", opts.directory
+      ? `/api/session?${new URLSearchParams({ directory: opts.directory })}` : "/api/session")).data,
+    createSession: async (session = {}) => (await request("POST", "/api/session",
+      opts.directory ? { ...session, location: session.location ?? { directory: opts.directory } } : session)).data,
+    getSession: async (id) => (await request("GET", `/api/session/${id}`)).data,
+    deleteSession: (id) => request("DELETE", `/api/session/${id}`),
+    abortSession: (id) => request("POST", `/api/session/${id}/interrupt`),
+    getSessionStatus: async () => (await request("GET", "/api/session/active")).data,
+    getSessionDiff: async (id) => (await request("GET", `/api/session/${id}/diff`)).data,
 
     // Messages
     getMessages: (sessionId, opts = {}) => {
       const params = new URLSearchParams();
       if (opts.limit) params.set("limit", String(opts.limit));
-      if (opts.before) params.set("before", opts.before);
+      if (opts.cursor) params.set("cursor", opts.cursor);
+      if (opts.order) params.set("order", opts.order);
       const qs = params.toString();
-      return request("GET", `/session/${sessionId}/message${qs ? "?" + qs : ""}`);
+      return request("GET", `/api/session/${sessionId}/message${qs ? "?" + qs : ""}`).then((r) => r.data);
     },
 
-    /**
-     * Send a prompt (synchronous / streaming).
-     * Returns the full response text from SSE stream.
-     *
-     * NOTE: OpenCode's POST /session/:id/message occasionally fails to close
-     * its HTTP response body after the session emits its terminal assistant
-     * message (observed against glm-5 backend, opencode 1.4.x). Relying on
-     * res.json() alone means the caller hangs until AbortSignal fires, which
-     * breaks downstream job-completion detection in the companion.
-     *
-     * Workaround: race the fetch against a session-completion watcher that
-     * polls GET /session/:id/message. When the latest assistant message has
-     * info.time.completed set AND finish !== undefined, the session is done;
-     * we abort the hanging fetch and synthesize the response from the poll.
-     */
+    /** Queue a V2 prompt and wait for its assistant message. */
     sendPrompt: async (sessionId, promptText, opts = {}) => {
-      const body = {
-        parts: [{ type: "text", text: promptText }],
-      };
-      if (opts.agent) body.agent = opts.agent;
-      if (opts.model) body.model = opts.model;
-      if (opts.system) body.system = opts.system;
-
-      const ac = new AbortController();
-      const timeoutId = setTimeout(() => ac.abort(new Error("prompt timeout")), PROMPT_TIMEOUT_MS);
       const startedAt = Date.now();
-      // Grace period so we don't mistake "session had no prior activity" for
-      // completion before the new prompt has even begun generating.
-      const MIN_POLL_DELAY_MS = 5_000;
-      const POLL_INTERVAL_MS = Number(process.env.OPENCODE_COMPLETION_POLL_MS) || 5_000;
-
-      const fetchPromise = (async () => {
-        const res = await fetch(`${baseUrl}/session/${sessionId}/message`, {
-          method: "POST",
-          headers,
-          body: JSON.stringify(body),
-          signal: ac.signal,
-        });
-        if (!res.ok) {
-          const text = await res.text().catch(() => "");
-          throw new Error(`OpenCode prompt failed ${res.status}: ${text}`);
-        }
-        return { source: "fetch", data: await res.json() };
-      })();
-
-      const watcherPromise = (async () => {
-        // Wait briefly so the new generation has a chance to start and we
-        // don't latch onto a stale completed message from before this prompt.
-        await new Promise((r) => setTimeout(r, MIN_POLL_DELAY_MS));
-
-        // Resolve the opencode serve PID once so we can check for child
-        // processes later. If this fails (Windows, no lsof, permissions)
-        // we silently skip the pgrep-based stuck detector — idle timeout
-        // still covers most cases.
-        const urlObj = (() => {
-          try { return new URL(baseUrl); } catch { return null; }
-        })();
-        const port = Number(urlObj?.port) || DEFAULT_PORT;
-        const opencodePid = resolveServePid(port);
-
-        let prevSig = "";
-        let lastActivityMs = Date.now();
-        let pgrepMissCount = 0;
-
-        while (!ac.signal.aborted) {
-          try {
-            const params = new URLSearchParams({ limit: "1" });
-            const r = await fetch(
-              `${baseUrl}/session/${sessionId}/message?${params.toString()}`,
-              { headers, signal: AbortSignal.timeout(10_000) },
-            );
-            if (r.ok) {
-              const arr = await r.json();
-              const last = Array.isArray(arr) ? arr[arr.length - 1] : null;
-              const info = last?.info;
-              const parts = Array.isArray(last?.parts) ? last.parts : [];
-              const completed = typeof info?.time?.completed === "number" ? info.time.completed : 0;
-              const hasTerminalFinish = typeof info?.finish === "string";
-              // Most recent tool part — the one actually "running" if any.
-              let lastTool = null;
-              for (let i = parts.length - 1; i >= 0; i--) {
-                if (parts[i]?.type === "tool") { lastTool = parts[i]; break; }
-              }
-
-              // Activity signature: any change here = progress was made.
-              const sig = JSON.stringify({
-                mid: info?.id,
-                created: info?.time?.created,
-                completed: info?.time?.completed,
-                parts: parts.length,
-                tStatus: lastTool?.state?.status,
-                tOutLen: (lastTool?.state?.output || "").length,
-              });
-              if (sig !== prevSig) {
-                lastActivityMs = Date.now();
-                prevSig = sig;
-                pgrepMissCount = 0;
-              }
-
-              // Completion signal: assistant message created after our prompt
-              // started. Some OpenCode versions omit `finish` on terminal messages.
-              if (
-                info &&
-                info.role === "assistant" &&
-                completed >= startedAt &&
-                (STRICT_TERMINAL ? hasTerminalFinish : hasTerminalFinish || completed > 0)
-              ) {
-                return { source: "watcher", data: last };
-              }
-
-              // Bash-tool stuck detector: latest tool is bash in status=running
-              // but opencode serve has zero children for N consecutive polls.
-              // This is the signature of the "ask permission deadlock" bug
-              // (sst/opencode#14473): the shell process already exited cleanly
-              // but tool state never flipped to completed.
-              if (
-                opencodePid &&
-                lastTool?.tool === "bash" &&
-                lastTool?.state?.status === "running"
-              ) {
-                const n = countChildren(opencodePid);
-                if (n === 0) {
-                  pgrepMissCount += 1;
-                  if (pgrepMissCount >= PGREP_MISS_THRESHOLD) {
-                    ac.abort(
-                      new Error(
-                        `bash tool stuck — opencode serve (pid ${opencodePid}) has no child for ${pgrepMissCount} polls while tool.status=running`,
-                      ),
-                    );
-                    throw new Error("bash tool stuck (no child)");
-                  }
-                } else if (n > 0) {
-                  pgrepMissCount = 0;
-                }
-                // n === -1 → feature unavailable, don't count either way
-              }
-
-              // Idle timeout: nothing happened in the session for too long.
-              // Covers all tool types (not just bash), including non-pgrep
-              // platforms (Windows).
-              const idleMs = Date.now() - lastActivityMs;
-              if (idleMs > IDLE_TIMEOUT_MS) {
-                const liveChildren = opencodePid ? countChildren(opencodePid) : 0;
-                if (liveChildren > 0) {
-                  lastActivityMs = Date.now();
-                  process.stderr.write(
-                    `opencode watcher: session idle ${Math.floor(idleMs / 1000)}s, but opencode serve (pid ${opencodePid}) has ${liveChildren} child process(es); continuing\n`,
-                  );
-                } else {
-                  ac.abort(
-                    new Error(
-                      `session idle ${Math.floor(idleMs / 1000)}s > ${IDLE_TIMEOUT_MS / 1000}s`,
-                    ),
-                  );
-                  throw new Error("session idle timeout");
-                }
-              }
-            }
-          } catch (err) {
-            // If we aborted above, propagate so the outer race sees a failure.
-            if (ac.signal.aborted) throw err;
-            // Otherwise it's a transient network/server blip — keep polling.
-          }
-          await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
-        }
-        throw new Error("watcher aborted");
-      })();
-
-      // Settle-wrap each so a single rejection doesn't lose the other side.
-      // Server-side 5-min POST cap means fetchPromise often rejects LONG
-      // before the agent is actually done; we must still wait on the watcher.
-      const wrap = (p, via) =>
-        p.then(
-          (v) => ({ ok: true, via, data: v.data }),
-          (err) => ({ ok: false, via, err }),
-        );
-      const runFetch = wrap(fetchPromise, "fetch");
-      const runWatcher = wrap(watcherPromise, "watcher");
-
-      try {
-        const first = await Promise.race([runFetch, runWatcher]);
-        if (first.ok) {
-          ac.abort();
-          fetchPromise.catch(() => {});
-          watcherPromise.catch(() => {});
-          return first.data;
-        }
-        // First to settle was a failure — the other promise may still succeed.
-        // Do NOT abort yet: in particular, the watcher needs to keep polling
-        // when the POST was killed by the server's 5-min cap but generation
-        // is still running.
-        const second = first.via === "fetch" ? await runWatcher : await runFetch;
-        ac.abort();
-        fetchPromise.catch(() => {});
-        watcherPromise.catch(() => {});
-        if (second.ok) return second.data;
-        // Both failed — surface the more informative error. Prefer the
-        // fetch error because it usually has the HTTP status/body.
-        const rawErr = first.via === "fetch" ? first.err : second.err;
-        throw classifyError(rawErr, {
-          baseUrl,
-          startedAt,
-          timeoutMs: PROMPT_TIMEOUT_MS,
-          op: "sendPrompt",
-        });
-      } finally {
-        clearTimeout(timeoutId);
+      if (opts.agent) await request("POST", `/api/session/${sessionId}/agent`, { agent: opts.agent });
+      if (opts.model) await request("POST", `/api/session/${sessionId}/model`, { model: modelRef(opts.model) });
+      const text = opts.system ? `${opts.system}\n\n${promptText}` : promptText;
+      await request("POST", `/api/session/${sessionId}/prompt`, { text });
+      let lastActivity = Date.now();
+      let signature = "";
+      while (Date.now() - startedAt < PROMPT_TIMEOUT_MS) {
+        const page = await request("GET", `/api/session/${sessionId}/message?limit=1&order=desc&type=assistant`);
+        const message = page.data?.[0];
+        const next = JSON.stringify(message ?? null);
+        if (next !== signature) { signature = next; lastActivity = Date.now(); }
+        if (message?.time?.completed >= startedAt &&
+            (STRICT_TERMINAL ? typeof message.finish === "string" : true)) return message;
+        if (Date.now() - lastActivity > IDLE_TIMEOUT_MS) throw new Error("session idle timeout");
+        await new Promise((resolve) => setTimeout(resolve, Number(process.env.OPENCODE_COMPLETION_POLL_MS) || 5000));
       }
+      throw new Error("prompt timeout");
     },
 
-    /**
-     * Send a prompt asynchronously (returns immediately).
-     */
-    sendPromptAsync: (sessionId, promptText, opts = {}) => {
-      const body = {
-        parts: [{ type: "text", text: promptText }],
-      };
-      if (opts.agent) body.agent = opts.agent;
-      if (opts.model) body.model = opts.model;
-      return request("POST", `/session/${sessionId}/prompt_async`, body);
+    sendPromptAsync: async (sessionId, promptText, opts = {}) => {
+      if (opts.agent) await request("POST", `/api/session/${sessionId}/agent`, { agent: opts.agent });
+      if (opts.model) await request("POST", `/api/session/${sessionId}/model`, { model: modelRef(opts.model) });
+      return (await request("POST", `/api/session/${sessionId}/prompt`, { text: promptText })).data;
     },
 
     // Agents
-    listAgents: () => request("GET", "/agent"),
+    listAgents: async () => (await request("GET", `/api/agent${locationQuery}`)).data,
 
     // Providers
-    listProviders: () => request("GET", "/provider"),
-    getProviderAuth: () => request("GET", "/provider/auth"),
+    listProviders: async () => (await request("GET", `/api/provider${locationQuery}`)).data,
+    listModels: async () => (await request("GET", `/api/model${locationQuery}`)).data,
 
     // Config
-    getConfig: () => request("GET", "/config"),
+    getConfig: () => request("GET", `/api/config${locationQuery}`),
 
     // Events (SSE) - returns a ReadableStream
     subscribeEvents: async () => {
-      const res = await fetch(`${baseUrl}/event`, {
+      const res = await fetch(`${baseUrl}/api/event`, {
         headers: { ...headers, Accept: "text/event-stream" },
       });
+      if (!res.ok) throw new Error(`OpenCode event stream returned ${res.status}`);
       return res.body;
     },
   };

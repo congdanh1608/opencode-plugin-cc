@@ -10,6 +10,7 @@ import path from "node:path";
 import { resolveWorkspace } from "./lib/workspace.mjs";
 import { loadState } from "./lib/state.mjs";
 import { isServerRunning, connect } from "./lib/opencode-server.mjs";
+import { serverUrl } from "./lib/server-auth.mjs";
 
 const PLUGIN_ROOT = process.env.CLAUDE_PLUGIN_ROOT || path.resolve(import.meta.dirname, "..");
 
@@ -25,7 +26,8 @@ async function main() {
   }
 
   // Check if server is available
-  if (!(await isServerRunning())) {
+  const active = new URL(serverUrl());
+  if (!(await isServerRunning(active.hostname, Number(active.port)))) {
     console.log("ALLOW: OpenCode server not running.");
     return;
   }
@@ -84,8 +86,8 @@ async function main() {
 
 function extractText(response) {
   if (typeof response === "string") return response;
-  if (response?.parts) {
-    return response.parts
+  if (response?.content) {
+    return response.content
       .filter((p) => p.type === "text")
       .map((p) => p.text)
       .join("\n");

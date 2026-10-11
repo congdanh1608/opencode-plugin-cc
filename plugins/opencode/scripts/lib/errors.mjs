@@ -16,7 +16,7 @@
  * @param {string} [ctx.baseUrl]
  * @param {number} [ctx.startedAt] - epoch ms when the request started
  * @param {number} [ctx.timeoutMs] - caller-side abort timeout
- * @param {string} [ctx.op] - operation name (e.g. "sendPrompt", "request GET /session")
+ * @param {string} [ctx.op] - operation name (e.g. "sendPrompt", "request GET /api/session")
  * @returns {Error}
  */
 export function classifyError(err, ctx = {}) {

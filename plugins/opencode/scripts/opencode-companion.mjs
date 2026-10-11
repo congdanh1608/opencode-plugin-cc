@@ -23,6 +23,7 @@ import { autoHealJob, autoHealJobs, getSessionLastActivity } from "./lib/auto-he
 import { checkOpencodeConfig } from "./lib/opencode-config.mjs";
 import { stateRoot } from "./lib/state.mjs";
 import { runCommand } from "./lib/process.mjs";
+import { serverUrl, authHeaders } from "./lib/server-auth.mjs";
 
 const PLUGIN_ROOT = process.env.CLAUDE_PLUGIN_ROOT || path.resolve(import.meta.dirname, "..");
 
@@ -74,21 +75,17 @@ async function handleSetup(argv) {
 
   let serverRunning = false;
   let providers = [];
+  const workspace = await resolveWorkspace();
 
   if (installed) {
-    serverRunning = await isServerRunning();
+    const active = new URL(serverUrl());
+    serverRunning = await isServerRunning(active.hostname, Number(active.port));
 
     if (serverRunning) {
       try {
-        const client = createClient("http://127.0.0.1:4096");
-        const providerList = await client.listProviders();
-        if (Array.isArray(providerList?.connected)) {
-          // Current opencode API: GET /provider returns {all, default, connected}.
-          providers = providerList.connected;
-        } else if (Array.isArray(providerList)) {
-          // Older opencode API: GET /provider returned a bare array of providers.
-          providers = providerList.map((p) => p.id ?? p.name).filter(Boolean);
-        }
+        const client = createClient(serverUrl(), { directory: workspace });
+        const models = await client.listModels();
+        providers = [...new Set(models.filter((m) => m.enabled).map((m) => m.providerID))];
       } catch {
         // Server may not be fully ready
       }
@@ -96,7 +93,6 @@ async function handleSetup(argv) {
   }
 
   // Handle review gate toggle
-  const workspace = await resolveWorkspace();
   let reviewGate = false;
 
   if (options["enable-review-gate"]) {
@@ -145,7 +141,7 @@ async function handleReview(argv) {
 
       report("reviewing", "Creating review session...");
       const session = await client.createSession({ title: `Code Review ${job.id}` });
-      upsertJob(workspace, { id: job.id, opencodeSessionId: session.id });
+      upsertJob(workspace, { id: job.id, opencodeSessionId: session.id, serverUrl: client.baseUrl });
 
       const prompt = await buildReviewPrompt(workspace, {
         base: options.base,
@@ -199,7 +195,7 @@ async function handleAdversarialReview(argv) {
 
       report("reviewing", "Creating adversarial review session...");
       const session = await client.createSession({ title: `Adversarial Review ${job.id}` });
-      upsertJob(workspace, { id: job.id, opencodeSessionId: session.id });
+      upsertJob(workspace, { id: job.id, opencodeSessionId: session.id, serverUrl: client.baseUrl });
 
       const prompt = await buildReviewPrompt(workspace, {
         base: options.base,
@@ -328,7 +324,7 @@ async function handleTask(argv) {
         const session = await client.createSession({ title: `Task ${job.id}` });
         sessionId = session.id;
       }
-      upsertJob(workspace, { id: job.id, opencodeSessionId: sessionId });
+      upsertJob(workspace, { id: job.id, opencodeSessionId: sessionId, serverUrl: client.baseUrl });
 
       const prompt = buildTaskPrompt(taskText, { write: isWrite });
 
@@ -337,6 +333,7 @@ async function handleTask(argv) {
 
       const response = await client.sendPrompt(sessionId, prompt, {
         agent: agentName,
+        model: options.model,
       });
 
       report("finalizing", "Processing task output...");
@@ -348,8 +345,8 @@ async function handleTask(argv) {
       if (isWrite) {
         try {
           const diff = await client.getSessionDiff(sessionId);
-          if (diff?.files) {
-            changedFiles = diff.files.map((f) => f.path || f.name).filter(Boolean);
+          if (Array.isArray(diff)) {
+            changedFiles = diff.map((f) => f.file).filter(Boolean);
           }
         } catch {
           // diff endpoint may not be available
@@ -402,13 +399,14 @@ async function handleTaskWorker(argv) {
         sessionId = session.id;
         report("starting", `Created session ${sessionId}`);
       }
-      upsertJob(workspace, { id: jobId, opencodeSessionId: sessionId });
+      upsertJob(workspace, { id: jobId, opencodeSessionId: sessionId, serverUrl: client.baseUrl });
 
       const prompt = buildTaskPrompt(taskText, { write: isWrite });
       report("investigating", "Running task...");
 
       const response = await client.sendPrompt(sessionId, prompt, {
         agent: agentName,
+        model: options.model,
       });
 
       const text = extractResponseText(response);
@@ -520,10 +518,10 @@ async function handleStatus(argv) {
   // instead of a stale "investigating" phase from state.json. Runs in parallel
   // and gracefully falls back if the server is unreachable.
   if (snapshot.running.length > 0) {
-    const baseUrl = "http://127.0.0.1:4096";
+    const baseUrl = serverUrl();
     await Promise.all(snapshot.running.map(async (job) => {
       if (!job.opencodeSessionId) return;
-      const act = await getSessionLastActivity(baseUrl, job.opencodeSessionId);
+      const act = await getSessionLastActivity(job.serverUrl ?? baseUrl, job.opencodeSessionId);
       if (!act) return;
       const age = act.ageSec != null ? `${act.ageSec}s ago` : "";
       if (act.kind === "tool") {
@@ -691,7 +689,7 @@ async function handleCancel(argv) {
   // Abort the OpenCode session if we have one
   if (job.opencodeSessionId) {
     try {
-      const client = createClient("http://127.0.0.1:4096");
+      const client = createClient(job.serverUrl ?? serverUrl());
       await client.abortSession(job.opencodeSessionId);
     } catch {
       // Server may not be running
@@ -780,8 +778,8 @@ function extractResponseText(response) {
   if (typeof response === "string") return response;
 
   // Response shape: { info: { ... }, parts: [ { type: "text", text: "..." }, ... ] }
-  if (response?.parts) {
-    return response.parts
+  if (response?.content) {
+    return response.content
       .filter((p) => p.type === "text")
       .map((p) => p.text)
       .join("\n");
@@ -847,18 +845,18 @@ async function handleDoctor(argv) {
   }
 
   // 4. server reachable
-  const serverUrl = "http://127.0.0.1:4096";
+  const serverAddress = serverUrl();
   let reachable = false;
   try {
-    const r = await fetch(`${serverUrl}/global/health`, { signal: AbortSignal.timeout(2000) });
+    const r = await fetch(`${serverAddress}/api/info`, { headers: authHeaders(), signal: AbortSignal.timeout(2000) });
     reachable = r.ok;
   } catch {
     reachable = false;
   }
   if (reachable) {
-    push("opencode-server", "PASS", `${serverUrl} reachable`, null);
+    push("opencode-server", "PASS", `${serverAddress} reachable`, null);
   } else {
-    push("opencode-server", "WARN", `${serverUrl} not reachable`,
+    push("opencode-server", "WARN", `${serverAddress} not reachable`,
       "Start it: opencode serve --port 4096 &");
   }
 
@@ -958,14 +956,13 @@ async function handleConfig(argv) {
     ["OPENCODE_MONITOR_HEARTBEAT_POLLS","(hook)", "Monitor hook: polls between heartbeat pings"],
     ["OPENCODE_COMPANION_CONFIG",   "~/.config/opencode/worker.json", "Worker config passed to opencode serve as OPENCODE_CONFIG"],
     ["OPENCODE_COMPANION_DATA",     "(self-derived)", "Override for plugin data dir"],
-    ["OPENCODE_SERVER_PASSWORD",    "(unset)", "HTTP Basic auth password"],
-    ["OPENCODE_SERVER_USERNAME",    "opencode", "HTTP Basic auth username"],
+    ["OPENCODE_PASSWORD",           "(managed)", "Server password stored in plugin state"],
   ];
   const envRows = envSpec.map(([name, dflt, desc]) => {
     const v = process.env[name];
     return {
       name,
-      value: v != null ? v : dflt,
+      value: name === "OPENCODE_PASSWORD" ? "(hidden)" : (v != null ? v : dflt),
       source: v != null ? "env" : (dflt.startsWith("(") ? "default" : "default"),
       description: desc,
     };
@@ -975,10 +972,10 @@ async function handleConfig(argv) {
   const sRoot = stateRoot(workspace);
   const cfg = checkOpencodeConfig();
   const missing = cfg.missing;
-  const serverUrl = "http://127.0.0.1:4096";
+  const serverAddress = serverUrl();
   let serverReachable = false;
   try {
-    const r = await fetch(`${serverUrl}/global/health`, { signal: AbortSignal.timeout(2000) });
+    const r = await fetch(`${serverAddress}/api/info`, { headers: authHeaders(), signal: AbortSignal.timeout(2000) });
     serverReachable = r.ok;
   } catch {}
 
@@ -992,7 +989,7 @@ async function handleConfig(argv) {
       permissionsOk: missing.length === 0,
       missing,
     },
-    server: { url: serverUrl, reachable: serverReachable },
+    server: { url: serverAddress, reachable: serverReachable },
   };
 
   if (wantJson) {
@@ -1004,7 +1001,7 @@ async function handleConfig(argv) {
   console.log(`- Workspace: ${workspace}`);
   console.log(`- State dir: ${sRoot}`);
   console.log(`- Config file: ${cfg.path} (${cfg.exists ? "exists" : "missing"}${missing.length ? ", missing: " + missing.join(",") : ", permissions OK"})`);
-  console.log(`- Server: ${serverUrl} (${serverReachable ? "reachable" : "unreachable"})`);
+  console.log(`- Server: ${serverAddress} (${serverReachable ? "reachable" : "unreachable"})`);
   console.log("\n### Environment variables\n");
   for (const r of envRows) {
     const src = r.source === "env" ? "env" : "default";

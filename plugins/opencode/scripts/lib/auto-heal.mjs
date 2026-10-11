@@ -23,8 +23,8 @@ import path from "node:path";
 
 import { ensureDir } from "./fs.mjs";
 import { upsertJob, jobDataPath } from "./state.mjs";
+import { authHeaders, serverUrl } from "./server-auth.mjs";
 
-const DEFAULT_BASE_URL = "http://127.0.0.1:4096";
 const STRICT_TERMINAL = process.env.OPENCODE_STRICT_TERMINAL === "1";
 // A worker/session can be legitimately silent for a while (big model thinking,
 // slow tool) — only declare it dead after >60s of no session activity AND no
@@ -32,13 +32,7 @@ const STRICT_TERMINAL = process.env.OPENCODE_STRICT_TERMINAL === "1";
 const STALE_IDLE_MS = 60_000;
 
 function buildHeaders() {
-  const headers = { "Content-Type": "application/json" };
-  if (process.env.OPENCODE_SERVER_PASSWORD) {
-    const user = process.env.OPENCODE_SERVER_USERNAME ?? "opencode";
-    const cred = Buffer.from(`${user}:${process.env.OPENCODE_SERVER_PASSWORD}`).toString("base64");
-    headers["Authorization"] = `Basic ${cred}`;
-  }
-  return headers;
+  return { "Content-Type": "application/json", ...authHeaders() };
 }
 
 /**
@@ -89,9 +83,8 @@ function extractPartsText(parts) {
 export async function probeSessionTerminal(baseUrl, sessionId, startedAtMs, headers) {
   const h = headers ?? buildHeaders();
   try {
-    // limit=1 → last message only. On glm-5 / opencode 1.4.x this returns
-    // an array of { info, parts } objects.
-    const res = await fetch(`${baseUrl}/session/${sessionId}/message?limit=1`, {
+    // V2 returns newest assistant messages first with order=desc.
+    const res = await fetch(`${baseUrl}/api/session/${sessionId}/message?limit=1&order=desc&type=assistant`, {
       method: "GET",
       headers: h,
       signal: AbortSignal.timeout(10_000),
@@ -99,9 +92,8 @@ export async function probeSessionTerminal(baseUrl, sessionId, startedAtMs, head
     if (!res.ok) {
       return { terminal: false, reachable: true, error: `HTTP ${res.status}` };
     }
-    const arr = await res.json();
-    const last = Array.isArray(arr) ? arr[arr.length - 1] : null;
-    const info = last?.info;
+    const page = await res.json();
+    const info = page.data?.[0];
     if (!info) {
       return { terminal: false, reachable: true, lastUpdatedAt: 0, lastInfo: null };
     }
@@ -111,7 +103,7 @@ export async function probeSessionTerminal(baseUrl, sessionId, startedAtMs, head
     const lastUpdatedAt = Math.max(completed, created);
 
     const looksTerminal =
-      info.role === "assistant" &&
+      info.type === "assistant" &&
       completed >= (startedAtMs || 0) &&
       (STRICT_TERMINAL
         ? typeof info.finish === "string"
@@ -122,7 +114,7 @@ export async function probeSessionTerminal(baseUrl, sessionId, startedAtMs, head
         terminal: true,
         finish: info.finish,
         completed,
-        text: extractPartsText(last.parts),
+        text: extractPartsText(info.content),
         info,
       };
     }
@@ -150,17 +142,17 @@ export async function getSessionLastActivity(baseUrl, sessionId) {
   if (!sessionId) return null;
   const h = buildHeaders();
   try {
-    const res = await fetch(`${baseUrl}/session/${sessionId}/message?limit=1`, {
+    const res = await fetch(`${baseUrl}/api/session/${sessionId}/message?limit=1&order=desc`, {
       method: "GET",
       headers: h,
       signal: AbortSignal.timeout(5_000),
     });
     if (!res.ok) return null;
-    const arr = await res.json();
-    const last = Array.isArray(arr) ? arr[arr.length - 1] : null;
+    const page = await res.json();
+    const last = page.data?.[0];
     if (!last) return null;
-    const info = last.info;
-    const parts = Array.isArray(last.parts) ? last.parts : [];
+    const info = last;
+    const parts = Array.isArray(last.content) ? last.content : [];
 
     const updatedMs = Math.max(
       typeof info?.time?.completed === "number" ? info.time.completed : 0,
@@ -173,10 +165,10 @@ export async function getSessionLastActivity(baseUrl, sessionId) {
       const p = parts[i];
       if (!p) continue;
       if (p.type === "tool") {
-        const tool = p.tool || "tool";
+        const tool = p.name || "tool";
         let command = "";
         const input = p.state?.input || p.input || {};
-        if (tool === "bash") command = String(input.command || input.cmd || "");
+        if (tool === "shell" || tool === "bash") command = String(input.command || input.cmd || "");
         else if (tool === "edit" || tool === "write") command = String(input.filePath || input.file_path || input.path || "");
         else if (tool === "read") command = String(input.filePath || input.file_path || input.path || "");
         else command = JSON.stringify(input).slice(0, 120);
@@ -213,7 +205,7 @@ function toEpochMs(v) {
  * @param {boolean} [opts.dryRun] - when true, do not write state; return `{job, action, details}`
  */
 export async function autoHealJob(workspace, job, opts = {}) {
-  const baseUrl = opts.baseUrl ?? DEFAULT_BASE_URL;
+  const baseUrl = opts.baseUrl ?? job?.serverUrl ?? serverUrl();
   const dryRun = !!opts.dryRun;
   const HEALABLE = new Set(["starting", "investigating", "running", "finalizing"]);
 
