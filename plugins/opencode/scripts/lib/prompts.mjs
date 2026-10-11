@@ -106,6 +106,7 @@ export const SAFETY_HEADER = [
   "Execute the task using Bash / Read / Write / Edit / Grep / Glob /",
   "WebFetch. If a task is too large, break it into smaller shell commands",
   "and iterate. Do NOT try to off-load work to another agent.",
+  "First read CLAUDE.md and AGENTS.md at the repo root (if present) and follow their rules, except the delegation rules above.",
 ].join(" ");
 
 /**
